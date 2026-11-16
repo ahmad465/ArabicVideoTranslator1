@@ -26,18 +26,17 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
-import com.example.arabicvideotranslator.core.YouTubeUrl
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
 /**
- * حالة المشغّل كما يبلّغ عنها YouTube IFrame Player API الرسمي (موضع التشغيل، الحالة، رمز الخطأ).
- * لا نصل إلى صوت الفيديو إطلاقاً؛ نقرأ الموضع الزمني فقط لمزامنة نطق ترجمة يوفّرها المستخدم.
+ * حالة المشغّل (موضع التشغيل والحالة). نقرأ الزمن فقط من صفحة التضمين الرسمية داخل WebView
+ * لمزامنة نطق ترجمة يوفّرها المستخدم؛ لا نصل إلى صوت الفيديو أو بثه إطلاقاً.
  */
 class PlayerBridge {
     @Volatile var positionMs: Long = 0
-    @Volatile var state: Int = -1      // 1 = playing, 2 = paused, 0 = ended, 3 = buffering, 5 = cued
-    @Volatile var errorCode: Int = 0   // 0 = لا خطأ؛ 9998/9999 أخطاء تحميل من التطبيق؛ والباقي من YouTube
+    @Volatile var state: Int = -1      // 1 = playing, 2 = paused, 0 = ended
+    @Volatile var errorCode: Int = 0
     @Volatile var ready: Boolean = false
 
     val isPlaying: Boolean get() = state == 1
@@ -47,7 +46,7 @@ class PlayerBridge {
     }
     @JavascriptInterface fun onState(s: Int) { state = s }
     @JavascriptInterface fun onError(code: Int) { errorCode = code }
-    @JavascriptInterface fun onReady() { ready = true; if (errorCode == 9999) errorCode = 0 }
+    @JavascriptInterface fun onReady() { ready = true }
 }
 
 fun playerErrorMessage(code: Int): String? = when (code) {
@@ -57,49 +56,36 @@ fun playerErrorMessage(code: Int): String? = when (code) {
     100 -> "الفيديو غير موجود أو خاص."
     101, 150 -> "صاحب الفيديو لا يسمح بتشغيله داخل التطبيقات."
     153 -> "YouTube رفض تعريف التطبيق (خطأ 153)."
-    9998 -> "تعذّر تحميل سكربت مشغل YouTube. تحقق من الإنترنت."
-    9999 -> "انتهت مهلة تحميل المشغل (لم يصبح جاهزاً)."
     else -> "خطأ في المشغل (رمز $code)."
 }
 
-internal fun buildPlayerHtml(videoId: String, appId: String): String {
-    require(YouTubeUrl.isValidId(videoId)) { "معرّف فيديو غير صالح" } // يمنع حقن JS
-    require(Regex("^[A-Za-z0-9._]+$").matches(appId)) { "appId غير صالح" }
-    return """
-<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>html,body{margin:0;height:100%;background:#000}#player{width:100%;height:100%}</style></head>
-<body><div id="player"></div>
-<script>
-var player; var isReady = false;
-setTimeout(function(){ if(!isReady){ NativeBridge.onError(9999); } }, 15000);
-</script>
-<script src="https://www.youtube.com/iframe_api" onerror="NativeBridge.onError(9998)"></script>
-<script>
-function onYouTubeIframeAPIReady(){
-  player = new YT.Player('player', {
-    width:'100%', height:'100%', videoId:'$videoId',
-    playerVars:{playsinline:1, rel:0, origin:'https://$appId'},
-    events:{
-      onReady:function(){ isReady = true; NativeBridge.onReady(); },
-      onStateChange:function(e){ NativeBridge.onState(e.data); },
-      onError:function(e){ NativeBridge.onError(e.data); }
+/** يقرأ زمن التشغيل وحالته من عنصر video في صفحة التضمين الرسمية. الناتج مثل "12.5|1|0" أو "none". */
+private const val READ_STATE_JS =
+    "(function(){var v=document.querySelector('video');if(!v)return 'none';" +
+        "return v.currentTime+'|'+(v.paused?0:1)+'|'+(v.ended?1:0);})()"
+
+/** يحلّل ناتج READ_STATE_JS (يأتي من evaluateJavascript محاطاً بعلامتي اقتباس) ويحدّث الجسر. */
+internal fun applyPlayerReading(raw: String?, bridge: PlayerBridge) {
+    val s = raw?.trim()?.trim('"') ?: return
+    val parts = s.split('|')
+    if (parts.size != 3) { bridge.ready = false; return }
+    val seconds = parts[0].toDoubleOrNull()
+    if (seconds == null || !seconds.isFinite() || seconds < 0) return
+    bridge.ready = true
+    bridge.positionMs = (seconds * 1000).toLong()
+    bridge.state = when {
+        parts[2] == "1" -> 0
+        parts[1] == "1" -> 1
+        else -> 2
     }
-  });
-  setInterval(function(){
-    if(player && player.getCurrentTime){ NativeBridge.onTime(player.getCurrentTime()); }
-  }, 200);
-}
-</script></body></html>
-""".trimIndent()
 }
 
-/** مشغل YouTube الرسمي داخل WebView: وضع IFrame API (يدعم مزامنة الدبلجة) ووضع بديل بتضمين مباشر (للعرض فقط). */
+/** مشغل YouTube الرسمي (صفحة التضمين) داخل WebView مع قراءة موضع التشغيل لمزامنة الدبلجة. */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun YouTubePlayer(videoId: String, bridge: PlayerBridge, appId: String) {
     val context = LocalContext.current
-    var alt by remember(videoId) { mutableStateOf(false) }
-    key(videoId, alt) {
+    key(videoId) {
         val holder = remember { mutableListOf<WebView>() }
         var info by remember { mutableStateOf("جارٍ تحميل المشغل…") }
 
@@ -115,24 +101,15 @@ fun YouTubePlayer(videoId: String, bridge: PlayerBridge, appId: String) {
                         webChromeClient = WebChromeClient()
                         webViewClient = WebViewClient()
                         bridge.positionMs = 0; bridge.state = -1; bridge.errorCode = 0; bridge.ready = false
-                        if (alt) {
-                            loadUrl(
-                                "https://www.youtube.com/embed/$videoId?playsinline=1&rel=0",
-                                mapOf("Referer" to "https://$appId")
-                            )
-                        } else {
-                            addJavascriptInterface(bridge, "NativeBridge")
-                            loadDataWithBaseURL("https://$appId", buildPlayerHtml(videoId, appId), "text/html", "utf-8", null)
-                        }
+                        loadUrl(
+                            "https://www.youtube.com/embed/$videoId?playsinline=1&rel=0",
+                            mapOf("Referer" to "https://$appId")
+                        )
                         holder.add(this)
                     }
                 }
             )
             Text(info, style = MaterialTheme.typography.bodySmall)
-            OutlinedButton(
-                onClick = { alt = !alt },
-                modifier = Modifier.fillMaxWidth()
-            ) { Text(if (alt) "العودة إلى المشغل الأساسي (يدعم الدبلجة)" else "جرّب المشغل البديل (عرض فقط)") }
             OutlinedButton(
                 onClick = {
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/watch?v=$videoId"))
@@ -143,20 +120,24 @@ fun YouTubePlayer(videoId: String, bridge: PlayerBridge, appId: String) {
             ) { Text("افتح الفيديو في YouTube") }
         }
 
-        LaunchedEffect(videoId, alt) {
+        // استعلام دوري عن موضع التشغيل (على الخيط الرئيسي كما يشترط evaluateJavascript)
+        LaunchedEffect(videoId) {
             while (isActive) {
+                holder.firstOrNull()?.evaluateJavascript(READ_STATE_JS) { raw -> applyPlayerReading(raw, bridge) }
                 val err = playerErrorMessage(bridge.errorCode)
                 info = when {
-                    alt -> "المشغل البديل: عرض فقط، لا تعمل الدبلجة المتزامنة. اضغط تشغيل داخل الفيديو."
                     err != null -> "$err (رمز ${bridge.errorCode})"
-                    bridge.ready -> "المشغل جاهز. حالة المشغل: ${bridge.state} (1 يعمل، 2 متوقف، 3 يحمّل، 5 جاهز)"
-                    else -> "جارٍ تحميل المشغل…"
+                    bridge.ready -> {
+                        val st = when (bridge.state) { 1 -> "يعمل"; 0 -> "انتهى"; else -> "متوقف" }
+                        "المشغل جاهز. الحالة: $st، الموضع: ${bridge.positionMs / 1000} ث"
+                    }
+                    else -> "جارٍ تحميل المشغل… اضغط تشغيل داخل الفيديو."
                 }
-                delay(500)
+                delay(250)
             }
         }
         DisposableEffect(Unit) {
-            onDispose { holder.forEach { it.stopLoading(); it.removeJavascriptInterface("NativeBridge"); it.destroy() }; holder.clear() }
+            onDispose { holder.forEach { it.stopLoading(); it.destroy() }; holder.clear() }
         }
     }
 }
