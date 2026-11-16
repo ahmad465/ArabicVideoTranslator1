@@ -93,12 +93,13 @@ function onYouTubeIframeAPIReady(){
 """.trimIndent()
 }
 
-/** مشغل YouTube الرسمي (IFrame API) داخل WebView، مع عرض حالة/خطأ المشغل وزر لفتح الفيديو في YouTube. */
+/** مشغل YouTube الرسمي داخل WebView: وضع IFrame API (يدعم مزامنة الدبلجة) ووضع بديل بتضمين مباشر (للعرض فقط). */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun YouTubePlayer(videoId: String, bridge: PlayerBridge, appId: String) {
     val context = LocalContext.current
-    key(videoId) {
+    var alt by remember(videoId) { mutableStateOf(false) }
+    key(videoId, alt) {
         val holder = remember { mutableListOf<WebView>() }
         var info by remember { mutableStateOf("جارٍ تحميل المشغل…") }
 
@@ -107,18 +108,31 @@ fun YouTubePlayer(videoId: String, bridge: PlayerBridge, appId: String) {
                 modifier = Modifier.fillMaxWidth().height(230.dp),
                 factory = { ctx ->
                     WebView(ctx).apply {
+                        setBackgroundColor(android.graphics.Color.BLACK)
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
+                        settings.mediaPlaybackRequiresUserGesture = false
                         webChromeClient = WebChromeClient()
                         webViewClient = WebViewClient()
-                        addJavascriptInterface(bridge, "NativeBridge")
                         bridge.positionMs = 0; bridge.state = -1; bridge.errorCode = 0; bridge.ready = false
-                        loadDataWithBaseURL("https://$appId", buildPlayerHtml(videoId, appId), "text/html", "utf-8", null)
+                        if (alt) {
+                            loadUrl(
+                                "https://www.youtube.com/embed/$videoId?playsinline=1&rel=0",
+                                mapOf("Referer" to "https://$appId")
+                            )
+                        } else {
+                            addJavascriptInterface(bridge, "NativeBridge")
+                            loadDataWithBaseURL("https://$appId", buildPlayerHtml(videoId, appId), "text/html", "utf-8", null)
+                        }
                         holder.add(this)
                     }
                 }
             )
             Text(info, style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(
+                onClick = { alt = !alt },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text(if (alt) "العودة إلى المشغل الأساسي (يدعم الدبلجة)" else "جرّب المشغل البديل (عرض فقط)") }
             OutlinedButton(
                 onClick = {
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/watch?v=$videoId"))
@@ -129,12 +143,13 @@ fun YouTubePlayer(videoId: String, bridge: PlayerBridge, appId: String) {
             ) { Text("افتح الفيديو في YouTube") }
         }
 
-        LaunchedEffect(videoId) {
+        LaunchedEffect(videoId, alt) {
             while (isActive) {
                 val err = playerErrorMessage(bridge.errorCode)
                 info = when {
+                    alt -> "المشغل البديل: عرض فقط، لا تعمل الدبلجة المتزامنة. اضغط تشغيل داخل الفيديو."
                     err != null -> "$err (رمز ${bridge.errorCode})"
-                    bridge.ready -> "المشغل جاهز. اضغط تشغيل داخل الفيديو."
+                    bridge.ready -> "المشغل جاهز. حالة المشغل: ${bridge.state} (1 يعمل، 2 متوقف، 3 يحمّل، 5 جاهز)"
                     else -> "جارٍ تحميل المشغل…"
                 }
                 delay(500)
